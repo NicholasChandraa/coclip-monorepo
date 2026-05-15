@@ -1,0 +1,60 @@
+[project]
+name = "engine"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "arq>=0.27.0",
+    "ctranslate2>=4.7.0",
+    "fastapi>=0.128.0",
+    "faster-whisper>=1.2.1",
+    "ffmpeg-python>=0.2.0",
+    "langchain>=1.2.8",
+    "langchain-core>=1.2.8",
+    "langchain-google-genai>=4.2.0",
+    "langgraph>=1.0.7",
+    "python-dotenv>=1.2.1",
+    "python-multipart>=0.0.22",
+    "redis>=5.3.1",
+    "rich>=14.3.2",
+    "uvicorn>=0.40.0",
+    "whisperx>=3.7.6",
+    "yt-dlp>=2026.1.31",
+    "torch>=2.6.0,<2.8",
+    "torchvision>=0.21.0,<0.22",
+    "torchaudio>=2.6.0,<2.8",
+    "sqlalchemy",
+    "asyncpg",
+    "python-speech-features>=0.6",
+    "opencv-python>=4.8",
+    "scipy>=1.10",
+    "easydict>=1.13",
+    "gdown>=5.1.0",
+    "piper-tts>=1.4.1",
+    "coqui-tts>=0.27.5",
+    "pyjwt>=2.11.0",
+    "httpx>=0.28.1",
+    "playwright>=1.49.0",
+    "google-genai>=1.62.0",
+    # f5-tts: installed manually via pip (uv can't resolve its cached-path/huggingface-hub conflict)
+    # To reinstall: .venv/Scripts/python.exe -m pip install f5-tts cached-path --no-deps
+]
+
+[tool.uv]
+override-dependencies = [
+    "torch>=2.7.0.dev",
+    "torchvision>=0.22.0.dev",
+    "torchaudio>=2.6.0",           # Coba gunakan versi stabil untuk torchaudio
+    "triton>=3.0.0; sys_platform != 'win32'",
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/nightly/cu128"  # Arahkan ke nightly CUDA 12.8
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }

@@ -1,0 +1,72 @@
+﻿# Dependencies
+node_modules/
+.pnpm-store/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Builds and caches
+.next/
+dist/
+build/
+.cache/
+*.tsbuildinfo
+.coverage/
+coverage/
+
+# Environment and secrets
+.env
+.env.*
+!**/.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*credentials*.json
+*credential*.json
+gen-lang-client-*.json
+*.db
+*.sqlite
+*.sqlite3
+
+# Runtime data
+storage/
+runtime/
+logs/
+temp/
+clips/
+tiktok_session/
+youtube_cookies.txt
+services/engine/model-asd/
+services/engine/model-tts/
+services/auth-service/.env
+services/auth-service/logs/
+services/engine/.env
+services/engine/logs/
+services/engine/tiktok_session/
+services/engine/youtube_cookies.txt
+
+# Generated media
+*.mp4
+*.mp3
+*.wav
+*.m4a
+*.webm
+*.mov
+*.avi
+*.mkv
+
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+

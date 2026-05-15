@@ -1,0 +1,27 @@
+﻿version: "3"
+
+tasks:
+  frontend:dev:
+    dir: apps/coclip-frontend
+    cmds:
+      - npm run dev
+
+  auth:dev:
+    dir: services/auth-service
+    cmds:
+      - go run cmd/server/main.go
+
+  engine:dev:
+    dir: services/engine
+    cmds:
+      - python main.py
+
+  infra:up:
+    cmds:
+      - docker compose -f infra/docker/docker-compose.yml up -d
+
+  check:
+    cmds:
+      - go test ./services/auth-service/...
+      - python -m compileall services/engine/app services/engine/main.py tools/testing-engine/app tools/testing-engine/main.py
+      - npm --prefix apps/coclip-frontend run lint

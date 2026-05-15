@@ -1,0 +1,31 @@
+﻿services:
+  postgres-auth:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: auth_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - coclip_auth_pgdata:/var/lib/postgresql/data
+
+  postgres-engine:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: model_clip
+    ports:
+      - "5434:5432"
+    volumes:
+      - coclip_engine_pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  coclip_auth_pgdata:
+  coclip_engine_pgdata:

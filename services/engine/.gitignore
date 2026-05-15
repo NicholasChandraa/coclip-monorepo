@@ -1,0 +1,49 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+wheels/
+*.egg-info
+
+# Video Processing Output
+clips/
+temp/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.ass
+test_subtitle_*.ass
+subtitle_preview.mp4
+
+# Logs
+logs/
+*.log
+
+# Social session artifacts
+tiktok_session/
+youtube_cookies.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models
+model-asd/
+model-tts/
+/models/
+
+
+.env
+.env.*
+!.env.example

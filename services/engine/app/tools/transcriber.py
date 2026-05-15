@@ -1,0 +1,455 @@
+import sys
+import os
+import gc
+
+# --- PyTorch 2.6+ Workaround ---
+# PyTorch 2.6 mengubah default weights_only=True yang memblokir load_model pyannote
+# Patch torch.load agar default weights_only=False
+import torch
+import torch.serialization
+
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    # FORCE weights_only=False
+    kwargs['weights_only'] = False
+
+    # Add safe globals for omegaconf (dipakai pyannote)
+    try:
+        from omegaconf import DictConfig, ListConfig
+        torch.serialization.add_safe_globals([DictConfig, ListConfig])
+    except:
+        pass
+
+    return _original_torch_load(*args, **kwargs)
+
+torch.load = _patched_torch_load
+# -------------------------------
+
+# --- torchaudio Compatibility Patch for nightly builds ---
+# torchaudio nightly (2.7+) removed several APIs that pyannote.audio depends on:
+#   - torchaudio.AudioMetaData (type annotation)
+#   - torchaudio.list_audio_backends() (backend discovery)
+#   - torchaudio.info() (audio file metadata)
+# We stub all three using soundfile as the backend.
+import torchaudio as _torchaudio
+if not hasattr(_torchaudio, "AudioMetaData"):
+    from dataclasses import dataclass
+
+    @dataclass
+    class _AudioMetaData:
+        sample_rate: int
+        num_frames: int
+        num_channels: int
+        bits_per_sample: int
+        encoding: str
+
+    _torchaudio.AudioMetaData = _AudioMetaData
+
+if not hasattr(_torchaudio, "list_audio_backends"):
+    def _list_audio_backends():
+        return ["soundfile"]
+    _torchaudio.list_audio_backends = _list_audio_backends
+
+if not hasattr(_torchaudio, "info"):
+    def _torchaudio_info(filepath, backend=None):
+        import soundfile as _sf
+        info = _sf.info(filepath)
+        return _torchaudio.AudioMetaData(
+            sample_rate=info.samplerate,
+            num_frames=info.frames,
+            num_channels=info.channels,
+            bits_per_sample=16,
+            encoding="PCM_S",
+        )
+    _torchaudio.info = _torchaudio_info
+# ----------------------------------------------------------
+
+# Fix untuk ctranslate2 ROCm DLL path error di Windows
+if sys.platform == "win32":
+    # Suppress ROCm DLL path errors on Windows
+    # ctranslate2 nyari ROCm SDK yang ga ada kalau pakai CUDA/CPU
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning)
+
+    # Patch os.add_dll_directory untuk ignore FileNotFoundError
+    _original_add_dll_directory = os.add_dll_directory
+    def _patched_add_dll_directory(path):
+        try:
+            return _original_add_dll_directory(path)
+        except (FileNotFoundError, OSError):
+            # Ignore ROCm path not found, lanjut pakai CUDA/CPU
+            pass
+    os.add_dll_directory = _patched_add_dll_directory
+
+# --- Patch huggingface_hub deprecated 'use_auth_token' ---
+# HARUS sebelum import whisperx/pyannote agar patch kena
+# Newer huggingface_hub hapus 'use_auth_token', ganti 'token'
+# Tapi whisperx & pyannote masih pakai 'use_auth_token'
+import huggingface_hub
+_original_hf_hub_download = huggingface_hub.hf_hub_download
+def _patched_hf_hub_download(*args, **kwargs):
+    if 'use_auth_token' in kwargs:
+        kwargs['token'] = kwargs.pop('use_auth_token')
+    return _original_hf_hub_download(*args, **kwargs)
+huggingface_hub.hf_hub_download = _patched_hf_hub_download
+# ----------------------------------------------------------
+
+import whisperx
+from app.core.config import settings
+from app.utils.logging import logger
+import time
+from typing import Optional, List, Any
+from threading import Lock
+from app.schemas.transcription import TranscriptionResultDetailed, TranscriptionSegment
+
+
+
+
+
+class WhisperXTranscriber:
+    """
+    Singleton class untuk WhisperX transcription.
+
+    WhisperX advantages over faster-whisper:
+    1. More accurate word-level timestamps (phoneme-based alignment)
+    2. Speaker diarization (detect who is speaking when)
+    3. Batch processing support
+
+    Perfect untuk auto-clipper karena:
+    - Presisi timestamp = clip boundaries lebih bagus
+    - Speaker detection = bisa highlight viral moments dari speaker tertentu
+
+    Thread-safe dengan Lock pattern.
+    """
+    _instance: Optional['WhisperXTranscriber'] = None
+    _model: Optional[Any] = None
+    _align_model: Optional[Any] = None
+    _align_metadata: Optional[dict] = None
+    _diarize_model: Optional[Any] = None
+    _last_language: Optional[str] = None
+    _lock: Lock = Lock()
+
+    # Config
+    _device: str = settings.WHISPER_DEVICE
+    _compute_type: str = settings.WHISPER_COMPUTE_TYPE
+    _batch_size: int = 4  # Safe default, auto-adjusted in load_model()
+    _keep_models_loaded: bool = False  # True on ≥16GB VRAM: skip inter-step unloads
+
+    def __new__(cls):
+        """Singleton pattern."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(WhisperXTranscriber, cls).__new__(cls)
+        return cls._instance
+
+    def load_model(self) -> None:
+        """
+        Load WhisperX model untuk transcription.
+
+        Model di-load sekali dan di-reuse untuk semua requests.
+        Alignment model dan diarization model di-load on-demand.
+        """
+        if self._model is None:
+            with self._lock:
+                if self._model is None:
+                    logger.info(f"📥 Loading WhisperX Model: {settings.WHISPER_MODEL} on {self._device}...")
+                    start_time = time.time()
+
+                    try:
+                        # Auto-detect batch_size based on VRAM
+                        if self._device == "cuda":
+                            import torch
+                            if torch.cuda.is_available():
+                                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                                if vram_gb >= 16:
+                                    self._batch_size = 32
+                                    self._keep_models_loaded = True
+                                    logger.info(f"  VRAM: {vram_gb:.1f}GB → batch_size={self._batch_size}, keep_models_loaded=True")
+                                elif vram_gb >= 8:
+                                    self._batch_size = 16
+                                    logger.info(f"  VRAM: {vram_gb:.1f}GB → batch_size={self._batch_size}")
+                                else:
+                                    self._batch_size = 4
+                                    logger.info(f"  VRAM: {vram_gb:.1f}GB → batch_size={self._batch_size} (low VRAM mode)")
+
+                        self._model = whisperx.load_model(
+                            settings.WHISPER_MODEL,
+                            self._device,
+                            compute_type=self._compute_type
+                        )
+                        duration = time.time() - start_time
+                        logger.info(f"✅ WhisperX model loaded in {duration:.2f}s")
+                    except Exception as e:
+                        import traceback
+                        logger.error(f"❌ Failed to load WhisperX model: {e}")
+                        logger.error(traceback.format_exc())
+                        raise e
+
+    def _free_vram(self) -> None:
+        """Run gc.collect + empty CUDA cache."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _unload_transcription_model(self) -> None:
+        """Unload WhisperX transcription model to free VRAM for alignment."""
+        if self._model is not None:
+            del self._model
+            self._model = None
+            self._free_vram()
+            logger.info("🗑️ Transcription model unloaded")
+
+    def _unload_align_model(self) -> None:
+        """Unload alignment model to free VRAM for diarization."""
+        if self._align_model is not None:
+            del self._align_model
+            self._align_model = None
+            self._align_metadata = None
+            self._last_language = None
+            self._free_vram()
+            logger.info("🗑️ Alignment model unloaded")
+
+    def _unload_diarize_model(self) -> None:
+        """Unload diarization model to free VRAM."""
+        if self._diarize_model is not None:
+            del self._diarize_model
+            self._diarize_model = None
+            self._free_vram()
+            logger.info("🗑️ Diarization model unloaded")
+
+    def unload_all(self) -> None:
+        """
+        Unload all models from GPU to free VRAM.
+        Models will be re-loaded on next job if needed.
+        """
+        logger.info("🗑️ Unloading all WhisperX models from GPU...")
+        self._unload_transcription_model()
+        self._unload_align_model()
+        self._unload_diarize_model()
+        if torch.cuda.is_available():
+            vram_free = torch.cuda.mem_get_info()[0] / 1024**3
+            logger.info(f"✅ WhisperX unloaded. GPU free: {vram_free:.1f}GB")
+
+    def _load_align_model(self, language_code: str) -> None:
+        """
+        Load alignment model untuk language tertentu.
+
+        Alignment model dipakai untuk:
+        - Word-level timestamps yang lebih presisi
+        - Phoneme-based alignment (lebih akurat dari Whisper native)
+
+        Model di-cache per language untuk efficiency.
+        """
+        # Kalau language sama dengan sebelumnya, skip reload
+        if self._align_model is not None and self._last_language == language_code:
+            return
+
+        with self._lock:
+            logger.info(f"📥 Loading alignment model for language: {language_code}")
+            start_time = time.time()
+
+            try:
+                # Cleanup previous alignment model
+                if self._align_model is not None:
+                    del self._align_model
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                # Load alignment model
+                kwargs = {"language_code": language_code, "device": self._device}
+                if language_code == "id":
+                    kwargs["model_name"] = "indonesian-nlp/wav2vec2-large-xlsr-indonesian"
+                    logger.info("🇮🇩 Using Indonesian alignment model")
+
+                self._align_model, self._align_metadata = whisperx.load_align_model(**kwargs)
+
+                self._last_language = language_code
+                duration = time.time() - start_time
+                logger.info(f"✅ Alignment model loaded in {duration:.2f}s")
+
+            except Exception as e:
+                logger.error(f"❌ Failed to load alignment model: {e}")
+                raise e
+
+    def _load_diarize_model(self) -> None:
+        """
+        Load speaker diarization model via WhisperX built-in.
+
+        Requires HF_TOKEN di .env untuk download pyannote model.
+        """
+        if self._diarize_model is None:
+            with self._lock:
+                if self._diarize_model is None:
+                    hf_token = os.getenv("HF_TOKEN")
+
+                    if not hf_token:
+                        logger.warning("⚠️ HF_TOKEN not found. Diarization disabled.")
+                        return
+
+                    logger.info("📥 Loading diarization model...")
+                    start_time = time.time()
+
+                    try:
+                        # WhisperX built-in diarization
+                        # huggingface_hub patch sudah di-apply di top-level
+                        from whisperx.diarize import DiarizationPipeline
+                        self._diarize_model = DiarizationPipeline(
+                            use_auth_token=hf_token,
+                            device=torch.device(self._device)
+                        )
+
+                        duration = time.time() - start_time
+                        logger.info(f"✅ Diarization model loaded in {duration:.2f}s")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to load diarization model: {e}")
+                        logger.info("📌 Continuing without diarization...")
+
+    def load_audio(self, audio_path: str):
+        """Load audio file into numpy array."""
+        logger.info(f"🎙️ Loading audio: {audio_path}")
+        return whisperx.load_audio(audio_path)
+
+    def step_transcribe(self, audio) -> dict:
+        """
+        Step 1: Transcription - Convert audio to text.
+
+        Args:
+            audio: Numpy array dari load_audio()
+
+        Returns:
+            Raw transcription result (segments + language)
+        """
+        if self._model is None:
+            self.load_model()
+
+        assert self._model is not None, "Model should be loaded"
+
+        logger.info(f"📝 Step 1/3: Transcribing audio (batch_size={self._batch_size})...")
+        start = time.time()
+
+        batch_size = self._batch_size
+        while batch_size >= 1:
+            try:
+                result = self._model.transcribe(audio, batch_size=batch_size)
+                duration = time.time() - start
+                logger.info(f"✅ Transcription done in {duration:.2f}s. Language: {result['language']}")
+                if not self._keep_models_loaded:
+                    self._unload_transcription_model()
+                return result
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and batch_size > 1:
+                    import torch, gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    batch_size = max(1, batch_size // 2)
+                    logger.warning(f"⚠️ OOM! Retrying with batch_size={batch_size}...")
+                else:
+                    raise
+
+        raise RuntimeError("Transcription failed: all batch sizes exhausted")
+
+    def step_align(self, segments: list, audio, language: str) -> dict:
+        """
+        Step 2: Alignment - Get precise word-level timestamps.
+
+        Args:
+            segments: Raw segments dari step_transcribe()
+            audio: Numpy array dari load_audio()
+            language: Detected language code
+
+        Returns:
+            Aligned result dengan word-level timestamps
+        """
+        logger.info("🎯 Step 2/3: Aligning for word-level timestamps...")
+        start = time.time()
+
+        self._load_align_model(language)
+
+        result = whisperx.align(
+            segments,
+            self._align_model,
+            self._align_metadata,
+            audio,
+            self._device,
+            return_char_alignments=False
+        )
+
+        duration = time.time() - start
+        logger.info(f"✅ Alignment done in {duration:.2f}s")
+        if not self._keep_models_loaded:
+            self._unload_align_model()
+
+        return result
+
+    def step_diarize(self, audio, result: dict) -> dict:
+        """
+        Step 3: Diarization - Detect speakers.
+
+        Args:
+            audio: Numpy array dari load_audio()
+            result: Aligned result dari step_align()
+
+        Returns:
+            Result dengan speaker labels assigned
+        """
+        logger.info("👥 Step 3/3: Detecting speakers...")
+        start = time.time()
+
+        self._load_diarize_model()
+
+        if self._diarize_model is None:
+            logger.info("⏭️ Diarization skipped (no HF_TOKEN)")
+            return result
+
+        try:
+            diarize_segments = self._diarize_model(audio)
+            result = whisperx.assign_word_speakers(diarize_segments, result)
+
+            speakers = set(seg.get("speaker", "Unknown") for seg in result["segments"])
+            duration = time.time() - start
+            logger.info(f"✅ Diarization done in {duration:.2f}s. Speakers: {speakers}")
+        except Exception as e:
+            logger.warning(f"⚠️ Diarization failed: {e}")
+        finally:
+            if not self._keep_models_loaded:
+                self._unload_diarize_model()
+
+        return result
+
+    def format_result(self, result: dict, language: str) -> TranscriptionResultDetailed:
+        """
+        Format raw WhisperX result ke TranscriptionResultDetailed.
+
+        Args:
+            result: Raw result dari step_align() atau step_diarize()
+            language: Detected language code
+
+        Returns:
+            Formatted TranscriptionResultDetailed (Pydantic Model)
+        """
+        segments = [
+            TranscriptionSegment(
+                start=seg["start"],
+                end=seg["end"],
+                text=seg["text"].strip(),
+                words=seg.get("words"),
+                speaker=seg.get("speaker")
+            )
+            for seg in result["segments"]
+        ]
+
+        duration = segments[-1].end if segments else 0.0
+
+        return TranscriptionResultDetailed(
+            language=language,
+            duration=duration,
+            total_segments=len(segments),
+            segments=segments
+        )
+
+
+# Global singleton instance
+# Import dan pakai instance ini di seluruh aplikasi
+transcriber = WhisperXTranscriber()
