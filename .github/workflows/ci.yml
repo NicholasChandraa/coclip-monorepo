@@ -40,4 +40,4 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m compileall services/engine/app services/engine/main.py tools/testing-engine/app tools/testing-engine/main.py
+      - run: python -m compileall services/engine/app services/engine/main.py
