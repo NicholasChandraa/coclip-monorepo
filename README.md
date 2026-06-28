@@ -2,6 +2,8 @@
 
 Coclip is a multi-service app for AI-assisted video/audio clipping, transcription, speaker-aware editing, and social upload workflows.
 
+- **Video Preview:** if you want to se the preview video on this project, please access through this Google Drive link: [Click here to see the Video](https://drive.google.com/drive/u/1/folders/1w3INW6VR6S9_CXWXjsA6aSy1krWM-4o9)
+
 ## Structure
 
 ```text
